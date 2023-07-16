@@ -1,289 +1,347 @@
-#!/bin/env bash
 
-readonly SCHEDULER_ENABLED=${SCHEDULER_ENABLED:-1}
-readonly SCHEDULER_DEBUG=${SCHEDULER_DEBUG:-0}
-
-readonly SCHEDULER_TASK_HOLDER_ROOT=$(mktemp -d)
-readonly SCHEDULER_TASK_HOLDER=$(mktemp ${SCHEDULER_TASK_HOLDER_ROOT}/$$.XXXXXXXXXX)
-readonly SCHEDULER_TASK_HOLDER_LOCK=$(mktemp ${SCHEDULER_TASK_HOLDER_ROOT}/$$.XXXXXXXXXX)
-readonly SCHEDULER_TASK_FINAL_STATUS=$(mktemp ${SCHEDULER_TASK_HOLDER_ROOT}/$$.XXXXXXXXXX)
-readonly SCHEDULER_TASK_LOG_FOLDER=$(mktemp -d)
-readonly SCHEDULER_CALLER_VARS=$(set | grep '^[a-zA-Z].*=.*' | sed '$a\ \n')
-readonly SCHEDULER_SEPARATOR="@@"
-readonly SCHEDULER_TASK_CODE_RUNNABLE="-127"
-readonly SCHEDULER_TASK_CODE_RUNNING="-1"
-readonly SCHEDULER_TASK_CODE_SUCCEED="0"
-readonly SCHEDULER_TASK_INITIAL_PID="PID_PLACEHOLDER"
-
-readonly SCHEDULER_CPU_COUNT=$(cat /proc/stat | grep -c cpu[0-9])
-readonly SCHEDULER_DEFAULT_RUNNER_SIZE=$((${SCHEDULER_CPU_COUNT} * 2))
-readonly SCHEDULER_MAX_RUNNER_SIZE=${SCHEDULER_MAX_RUNNER_SIZE:-${SCHEDULER_DEFAULT_RUNNER_SIZE}}
-readonly SCHEDULER_AVAILABLE_RUNNER_SIZE=$(mktemp ${SCHEDULER_TASK_HOLDER_ROOT}/$$.XXXXXXXXXX)
-
-scheduler_task_id=0
-
-function scheduler::startup() {
-  readonly SCHEDULER_TASK_XTRACE_STATE=$(shopt -q -o xtrace; echo $?)
-  if ! scheduler::is_enabled; then
-    scheduler::log_warn "Scheduler is disabled, switch to serial mode"
+function sched::startup() {
+  readonly SCHED_ENABLED=${SCHED_ENABLED:-1}
+  if ! sched::is_enabled; then
+    sched::log_warn "Scheduler is disabled, switch to serial mode"
     return
   fi
-  if [[ ${SCHEDULER_MAX_RUNNER_SIZE} -le 0 ]]; then
-    scheduler::log_fatal "SCHEDULER_MAX_RUNNER_SIZE must great than 0"
+
+  readonly SCHED_DATA_ROOT=${SCHED_DATA_ROOT:-$(mktemp -d)}
+  readonly SCHED_TASK_HOLDER=$(mktemp -p ${SCHED_DATA_ROOT} $$.XXXXXXXXXX)
+  readonly SCHED_TASK_HOLDER_LOCK=$(mktemp -p ${SCHED_DATA_ROOT} $$.XXXXXXXXXX)
+  readonly SCHED_TASK_FINAL_STATUS=$(mktemp -p ${SCHED_DATA_ROOT} $$.XXXXXXXXXX)
+  readonly SCHED_TASK_LOG_FOLDER=$(mktemp -p ${SCHED_DATA_ROOT} -d)
+  readonly SCHED_CALLER_VARS=$(set | grep '^[a-zA-Z].*=.*' | sed '$a\ \n')
+  readonly SCHED_SEPARATOR="@@"
+  readonly SCHED_TASK_CODE_RUNNABLE="-127"
+  readonly SCHED_TASK_CODE_RUNNING="-1"
+  readonly SCHED_TASK_CODE_SUCCEED="0"
+  readonly SCHED_TASK_INITIAL_PID="PID_PLACEHOLDER"
+
+  readonly SCHED_CPU_COUNT=$(cat /proc/stat | grep -c cpu[0-9])
+  readonly SCHED_DEFAULT_RUNNERS=$((${SCHED_CPU_COUNT} * 2))
+  readonly SCHED_MAX_RUNNERS=${SCHED_MAX_RUNNERS:-${SCHED_DEFAULT_RUNNERS}}
+  readonly SCHED_ACTIVE_RUNNERS=$(mktemp -p ${SCHED_DATA_ROOT} $$.XXXXXXXXXX)
+  readonly SCHED_AVAILABLE_RUNNERS=$(mktemp -p ${SCHED_DATA_ROOT} $$.XXXXXXXXXX)
+  if [[ ${SCHED_MAX_RUNNERS} -le 0 ]]; then
+    sched::log_fatal "SCHED_MAX_RUNNERS must great than 0"
     exit 1
   fi
-  scheduler::log_info "Scheduler startup..."
-  scheduler::log_info "SCHEDULER_TASK_HOLDER at $SCHEDULER_TASK_HOLDER"
-  echo "${SCHEDULER_MAX_RUNNER_SIZE}" > "${SCHEDULER_AVAILABLE_RUNNER_SIZE}"
-  scheduler::dispatcher &
-  scheduler_dispatcher_pid=$!
-  scheduler::rover &
-  scheduler_rover_pid=$!
+
+  readonly SCHED_DEBUG=${SCHED_DEBUG:-0}
+  readonly SCHED_TASK_XTRACE_STATE=$(shopt -q -o xtrace; echo $?)
+
+  sched::log_info "Sched startup..."
+  sched::log_info "tasks holder at $SCHED_TASK_HOLDER"
+  sched_task_id=0
+  echo "${SCHED_MAX_RUNNERS}" > "${SCHED_ACTIVE_RUNNERS}"
+  echo "${SCHED_MAX_RUNNERS}" > "${SCHED_AVAILABLE_RUNNERS}"
+  sched::dispatcher &
+  sched_dispatcher_pid=$!
+  sched::rover &
+  sched_rover_pid=$!
+  sched::runner_tuner &
+  sched_tuner_pid=$!
 }
 
-function scheduler::shutdown() {
-  scheduler::is_enabled || return 0
-  kill -SIGUSR1 ${scheduler_dispatcher_pid} ${scheduler_rover_pid}
-  scheduler::terminate_running_tasks
-  scheduler::print_pending_tasks
-  scheduler::log_info "Scheduler shutdown..."
+function sched::shutdown() {
+  sched::is_enabled || return 0
+  kill -SIGUSR1 ${sched_dispatcher_pid} ${sched_rover_pid} ${sched_tuner_pid} || true
+  sched::terminate_running_tasks
+  sched::print_pending_tasks
+  sched::log_info "Sched shutdown..."
 }
 
-function scheduler::emit() {
+function sched::emit() {
+  set +x
   local task_cmd=$1
-  if ! scheduler::is_enabled; then
-    eval ${task_cmd}
-    return
+  local task_priority=${2:-0}
+  if ! sched::is_enabled; then
+    eval "sched::open_xtrace && ${task_cmd}"
+  else
+    if [[ ! ${task_priority} =~ ^-?[0-9]+$ ]]; then
+      sched::log_fatal "Task priority must be a number"
+      exit 1
+    fi
+    sched::init_task "${task_cmd}" "$(sched::get_caller_env)" "${task_priority}"
+    sched::open_xtrace
   fi
-  scheduler::close_xtrace
-  scheduler::init_task "${task_cmd}" "$(scheduler::get_caller_env)"
-  scheduler::open_xtrace
 }
 
-function scheduler::dispatcher() {
+function sched::dispatcher() { 
   set +x
   trap 'exit' SIGUSR1
   while true; do
-    for task_id in $(scheduler::get_runnable_tasks); do
-      [[ "${task_id}" == "" ]] && break
-      local task_cmd="$(scheduler::get_task_cmd "${task_id}")"
-      scheduler::lease_runner "${task_cmd}" || continue
-      local task_logfile="$(scheduler::get_task_logfile "${task_id}")"
-      scheduler::set_task_status "${task_id}" "${SCHEDULER_TASK_CODE_RUNNING}"
-      scheduler::run_task "${task_id}" &
-      local task_pid=$!
-      scheduler::set_task_pid "${task_id}" "${task_pid}"
-      scheduler::log_info "Task [ ${task_cmd} ] run with PID ${task_pid} Log ${task_logfile}"
-    done
     sleep 1
+    local task_id=$(sched::pick_task)
+    [[ -z "${task_id}" ]] && continue
+    local task_cmd="$(sched::get_task_cmd "${task_id}")"
+    sched::lease_runner "${task_cmd}" || continue
+    local task_logfile="$(sched::get_task_logfile "${task_id}")"
+    sched::set_task_status "${task_id}" "${SCHED_TASK_CODE_RUNNING}"
+    sched::run_task "${task_id}" &
+    local task_pid=$!
+    sched::set_task_pid "${task_id}" "${task_pid}"
+    sched::log_info "Task ${task_id} [ ${task_cmd} ] run with PID ${task_pid} Log ${task_logfile}"
   done
 }
 
-function scheduler::rover() {
+function sched::rover() {
   set +x
   trap 'exit' SIGUSR1
   while true; do
     while read task; do
-      local task_id=${task%%"${SCHEDULER_SEPARATOR}"*}
-      local task_cmd="$(scheduler::get_task_cmd "${task_id}")"
-      local task_ret=$(scheduler::get_task_status "${task_id}")
+      local task_id=${task%%"${SCHED_SEPARATOR}"*}
+      local task_cmd="$(sched::get_task_cmd "${task_id}")"
+      local task_ret=$(sched::get_task_status "${task_id}")
       case ${task_ret} in
-        ""|${SCHEDULER_TASK_CODE_RUNNABLE}|${SCHEDULER_TASK_CODE_RUNNING}) continue ;;
-        ${SCHEDULER_TASK_CODE_SUCCEED})
-          scheduler::free_runner "${task_cmd}" || continue
-          local task_logfile=$(scheduler::get_task_logfile "${task_id}")
-          scheduler::log_info "Task [ ${task_cmd} ] succeeded. Log start ${task_logfile}..."
-          tail -n 500 "${task_logfile}"
+        ""|${SCHED_TASK_CODE_RUNNABLE}|${SCHED_TASK_CODE_RUNNING}) continue ;;
+        ${SCHED_TASK_CODE_SUCCEED})
+          sched::free_runner "${task_cmd}" || continue
+          local task_logfile=$(sched::get_task_logfile "${task_id}")
+          sched::log_info "Task ${task_id} [ ${task_cmd} ] succeeded. Log start ${task_logfile}..."
+          cat "${task_logfile}"
           echo
-          scheduler::remove_task "${task_id}"
+          sched::remove_task "${task_id}"
           ;;
         *)
-          scheduler::free_runner "${task_cmd}" || continue
-          local task_logfile=$(scheduler::get_task_logfile "${task_id}")
-          scheduler::log_fatal "Task [ ${task_cmd} ] failed. Log start..."
-          tail -n 1000 "${task_logfile}"
-          scheduler::log_fatal "Please check logs [ ${task_logfile} ] for more info about task [ ${task_cmd} ]. Installer will exit."
-          echo "${task_ret}" > ${SCHEDULER_TASK_FINAL_STATUS}
-          scheduler::remove_task "${task_id}"
+          sched::free_runner "${task_cmd}" || continue
+          local task_logfile=$(sched::get_task_logfile "${task_id}")
+          sched::log_fatal "Task ${task_id} [ ${task_cmd} ] failed. Log start..."
+          cat "${task_logfile}"
+          sched::log_fatal "Please check logs [ ${task_logfile} ] for more info about task [ ${task_cmd} ]. Installer will exit."
+          echo "${task_ret}" > ${SCHED_TASK_FINAL_STATUS}
+          sched::remove_task "${task_id}"
       esac
-    done <<<"$(cat "${SCHEDULER_TASK_HOLDER}")"
+    done <<<"$(cat "${SCHED_TASK_HOLDER}")"
     sleep 1
   done
 }
 
-function scheduler::wait_all_tasks() {
+function sched::wait_all_tasks() {
   set +x
-  scheduler::is_enabled || return 0
+  sched::is_enabled || return 0
   local need_exit=${1:-0}
   while true; do
     sleep 2
-    if [[ -s ${SCHEDULER_TASK_FINAL_STATUS} ]]; then
-      exit $(cat "${SCHEDULER_TASK_FINAL_STATUS}")
-    elif scheduler::is_tasks_empty; then
+    if [[ -s ${SCHED_TASK_FINAL_STATUS} ]]; then
+      exit $(cat "${SCHED_TASK_FINAL_STATUS}")
+    elif sched::is_tasks_empty; then
       [[ "${need_exit}" == "1" ]] && exit || break
     else
       local task_id=
-      for task_id in $(scheduler::get_running_tasks); do
-        local task_cmd="$(scheduler::get_task_cmd "${task_id}")"
-        local task_logfile="$(scheduler::get_task_logfile "${task_id}")"
-        scheduler::log_infonl "Wait for Task [ ${task_cmd} ] Log ${task_logfile}"
+      for task_id in $(sched::get_running_tasks); do
+        local task_logfile="$(sched::get_task_logfile "${task_id}")"
+        sched::log_infonl "Wait for Task ${task_id} Log ${task_logfile}"
         break
       done
     fi
   done
-  scheduler::open_xtrace
+  sched::open_xtrace
 }
 
-function scheduler::wait_all_tasks_and_exit() { scheduler::wait_all_tasks 1; }
+function sched::wait_all_tasks_and_exit() { sched::wait_all_tasks 1; }
 
-function scheduler::terminate_running_tasks() {
-  scheduler::is_tasks_empty && return
-  for task_id in $(scheduler::get_running_tasks); do
-    local task_pid="$(scheduler::get_task_pid "${task_id}")"
-    kill -9 $(ps -eo pid,ppid | awk "\$2==\"${task_pid}\" {print \$1}") "${task_pid}"
-    scheduler::log_warn "TASK [ $(scheduler::get_task_cmd "${task_id}") ] terminated"
+function sched::terminate_running_tasks() {
+  sched::is_tasks_empty && return
+  for task_id in $(sched::get_running_tasks); do
+    local task_pid="$(sched::get_task_pid "${task_id}")"
+    kill $(ps -eo pid,ppid | awk "\$2==\"${task_pid}\" {print \$1}") "${task_pid}"
+    sched::log_warn "TASK ${task_id} [ $(sched::get_task_cmd "${task_id}") ] terminated"
   done
 }
 
-function scheduler::print_pending_tasks() {
-  scheduler::is_tasks_empty && return
+function sched::print_pending_tasks() {
+  sched::is_tasks_empty && return
   local pending_tasks=
-  for task_id in $(scheduler::get_runnable_tasks); do
-    pending_tasks="[ $(scheduler::get_task_cmd "${task_id}") ], ${pending_tasks}"
+  for task_id in $(sched::get_runnable_tasks); do
+    pending_tasks="[ $(sched::get_task_cmd "${task_id}") ], ${pending_tasks}"
   done
   [[ -z "${pending_tasks}" ]] && return
-  scheduler::log_warn "Pending tasks: ${pending_tasks}"
+  sched::log_warn "Pending tasks: ${pending_tasks}"
 }
 
-function scheduler::log_debug() { [[ "${SCHEDULER_DEBUG}" == "1" ]] && echo -e "\033[1;34m[scheduler-debug] $1\033[0m" || true; }
+function sched::log_debug() { [[ "${SCHED_DEBUG}" == "1" ]] && echo -e "\033[K\033[1;34m[sched-debug] $1\033[0m" || true; }
 
-function scheduler::log_info() { echo -e "\033[1;36m[scheduler-info] $1\033[0m"; }
+function sched::log_info() { echo -e "\033[K\033[1;36m[sched-info] $1\033[0m"; }
 
-function scheduler::log_infonl() { echo -e -n "\033[37m[scheduler-info] $1\033[0m\r"; }
+function sched::log_infonl() { echo -e -n "\033[K\033[37m[sched-info] $1\033[0m\r"; }
 
-function scheduler::log_warn() { echo -e "\033[1;33m[scheduler-warn] $1\033[0m"; }
+function sched::log_warn() { echo -e "\033[K\033[1;33m[sched-warn] $1\033[0m"; }
 
-function scheduler::log_fatal() { echo -e "\033[1;31m[scheduler-fatal] $1\033[0m"; }
+function sched::log_fatal() { echo -e "\033[K\033[1;31m[sched-fatal] $1\033[0m"; }
 
-function scheduler::open_xtrace() { [[ "${SCHEDULER_TASK_XTRACE_STATE}" == "0" ]] && set -x || true; }
+function sched::open_xtrace() { [[ "${SCHED_TASK_XTRACE_STATE}" == "0" ]] && set -x || true; }
 
-function scheduler::close_xtrace() { [[ "${SCHEDULER_TASK_XTRACE_STATE}" == "0" ]] && set +x || true; }
+function sched::close_xtrace() { [[ "${SCHED_TASK_XTRACE_STATE}" == "0" ]] && set +x || true; }
 
-function scheduler::is_enabled() { [[ "${SCHEDULER_ENABLED}" == "1" ]]; }
+function sched::is_enabled() { [[ "${SCHED_ENABLED}" == "1" ]]; }
 
-function scheduler::is_tasks_empty() { [[ ! -s ${SCHEDULER_TASK_HOLDER} ]]; }
+function sched::is_tasks_empty() { [[ ! -s ${SCHED_TASK_HOLDER} ]]; }
 
-function scheduler::lock() { exec 200< "${SCHEDULER_AVAILABLE_RUNNER_SIZE}"; flock -w 1 200; }
+function sched::lock() { exec 200< "${SCHED_AVAILABLE_RUNNERS}"; flock -w 1 200; }
 
-function scheduler::unlock() { flock -u 200; }
+function sched::unlock() { flock -u 200; }
 
-function scheduler::lease_runner() {
+function sched::lease_runner() {
   local task_cmd=$1
-  scheduler::lock || return 1
-  local available_runner_size=$(cat "${SCHEDULER_AVAILABLE_RUNNER_SIZE}")
-  if [[ ${available_runner_size} -gt 0 ]]; then
-    echo $((available_runner_size - 1)) > "${SCHEDULER_AVAILABLE_RUNNER_SIZE}"
-    scheduler::log_debug "Task [ ${task_cmd} ] lease runner successful. Runner [available $((available_runner_size - 1)), max ${SCHEDULER_MAX_RUNNER_SIZE}]"
-    scheduler::unlock
+  sched::lock || return 1
+  local available_runner_size=$(cat "${SCHED_AVAILABLE_RUNNERS}")
+  local active_runner_size=$(cat "${SCHED_ACTIVE_RUNNERS}")
+  local leased_runners=$((SCHED_MAX_RUNNERS - available_runner_size))
+  if [[ ${available_runner_size} -gt 0 ]] && [[ ${active_runner_size} -gt ${leased_runners} ]]; then
+    echo $((available_runner_size - 1)) > "${SCHED_AVAILABLE_RUNNERS}"
+    sched::log_debug "Task [ ${task_cmd} ] lease runner successful. Runner [available $((available_runner_size - 1)), active ${active_runner_size}, max ${SCHED_MAX_RUNNERS}]"
+    sched::unlock
   else
-    scheduler::log_debug "Task [ ${task_cmd} ] lease runner failed. Runner [available ${available_runner_size}, max ${SCHEDULER_MAX_RUNNER_SIZE}]"
-    scheduler::unlock
+    sched::log_debug "Task [ ${task_cmd} ] lease runner failed. Runner [available ${available_runner_size}, active ${active_runner_size}, max ${SCHED_MAX_RUNNERS}]"
+    sched::unlock
     return 1
   fi
 }
 
-function scheduler::free_runner() {
+function sched::free_runner() {
   local task_cmd=$1
-  scheduler::lock || return 1
-  local available_runner_size=$(cat "${SCHEDULER_AVAILABLE_RUNNER_SIZE}")
-  if [[ ${available_runner_size} -lt ${SCHEDULER_MAX_RUNNER_SIZE} ]]; then
-    echo $((available_runner_size + 1 )) > "${SCHEDULER_AVAILABLE_RUNNER_SIZE}"
-    scheduler::log_debug "Task [ ${task_cmd} ] free runner successful. Runner [available $((available_runner_size + 1)), max ${SCHEDULER_MAX_RUNNER_SIZE}]"
-    scheduler::unlock
+  sched::lock || return 1
+  local available_runner_size=$(cat "${SCHED_AVAILABLE_RUNNERS}")
+  local active_runner_size=$(cat "${SCHED_ACTIVE_RUNNERS}")
+  if [[ ${available_runner_size} -lt ${SCHED_MAX_RUNNERS} ]]; then
+    echo $((available_runner_size + 1 )) > "${SCHED_AVAILABLE_RUNNERS}"
+    sched::log_debug "Task [ ${task_cmd} ] free runner successful. Runner [available $((available_runner_size + 1)), active ${active_runner_size}, max ${SCHED_MAX_RUNNERS}]"
+    sched::unlock
   else
-    scheduler::log_debug "Task [ ${task_cmd} ] free runner failed. Runner [available ${available_runner_size}, max ${SCHEDULER_MAX_RUNNER_SIZE}]"
-    scheduler::unlock
+    sched::log_debug "Task [ ${task_cmd} ] free runner failed. Runner [available ${available_runner_size}, active ${active_runner_size}, max ${SCHED_MAX_RUNNERS}]"
+    sched::unlock
     return 1
   fi
 }
 
-function scheduler::init_task() {
+function sched::runner_tuner() {
+  set +x
+  trap 'exit' SIGUSR1
+  # proportional gain control
+  local gain=0.8
+  local target_load=1.5
+
+  local num_runner_raw=1
+  local num_runners=${NUM_RUNNERS_RAW}
+
+  while true; do
+    local load_factor=$(awk -v x=$(cut -d " " -f 1 /proc/loadavg) -v y=${SCHED_CPU_COUNT} 'BEGIN{printf "%.2f", x/y}')
+    local adjust=$(awk -v x=${target_load} -v y=${load_factor} -v z=${gain} 'BEGIN{printf "%.2f", (x-y)*z}')
+
+    local new_runners_raw=$(awk -v x=${num_runner_raw} -v y=${adjust} 'BEGIN{printf "%.2f", x + y}')
+    local new_runners=$(printf "%.f" ${new_runners_raw})
+
+    if [[ ${new_runners} -lt 1 ]]; then
+      num_runners=1
+    elif [[ ${new_runners} -gt ${SCHED_MAX_RUNNERS} ]]; then
+      num_runners=${SCHED_MAX_RUNNERS}
+    else
+      num_runners=${new_runners}
+      num_runner_raw=${new_runners_raw}
+    fi  
+
+    sched::lock || continue
+    local active_runners=$(cat "${SCHED_ACTIVE_RUNNERS}")
+    if [[ ${active_runners} -ne ${num_runners} ]]; then
+      echo ${num_runners} > "${SCHED_ACTIVE_RUNNERS}"
+      sched::log_debug "Runner tuned [previous ${active_runners}, current ${num_runners}]"
+    fi
+    sched::unlock
+    sleep 3
+  done
+}
+
+function sched::init_task() {
   local task_cmd=$1
   local task_env=$2
-  local task_id=$((++scheduler_task_id))
-  until flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" grep -q "^${task_id}${SCHEDULER_SEPARATOR}" "${SCHEDULER_TASK_HOLDER}"; do
-    flock "${SCHEDULER_TASK_HOLDER_LOCK}" echo "${task_id}${SCHEDULER_SEPARATOR}${task_cmd}${SCHEDULER_SEPARATOR}${SCHEDULER_TASK_CODE_RUNNABLE}${SCHEDULER_SEPARATOR}${SCHEDULER_TASK_INITIAL_PID}${SCHEDULER_SEPARATOR}${SCHEDULER_TASK_LOG_FOLDER}/$RANDOM$RANDOM.log${SCHEDULER_SEPARATOR}${task_env}" >> "${SCHEDULER_TASK_HOLDER}"
+  local task_priority=$3
+  local task_id=$((++sched_task_id))
+  until flock -s "${SCHED_TASK_HOLDER_LOCK}" grep -q "^${task_id}${SCHED_SEPARATOR}" "${SCHED_TASK_HOLDER}"; do
+    flock "${SCHED_TASK_HOLDER_LOCK}" echo "${task_id}${SCHED_SEPARATOR}${task_cmd}${SCHED_SEPARATOR}${SCHED_TASK_CODE_RUNNABLE}${SCHED_SEPARATOR}${SCHED_TASK_INITIAL_PID}${SCHED_SEPARATOR}${SCHED_TASK_LOG_FOLDER}/$RANDOM$RANDOM.log${SCHED_SEPARATOR}${task_env}${SCHED_SEPARATOR}${task_priority}" >> "${SCHED_TASK_HOLDER}"
   done
 }
 
-function scheduler::remove_task() {
+function sched::remove_task() {
   local task_id=$1
-  until ! flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" grep -q "^${task_id}${SCHEDULER_SEPARATOR}" "${SCHEDULER_TASK_HOLDER}"; do
-    flock "${SCHEDULER_TASK_HOLDER_LOCK}" sed -i "/^"${task_id}${SCHEDULER_SEPARATOR}"/d" ${SCHEDULER_TASK_HOLDER}
+  until ! flock -s "${SCHED_TASK_HOLDER_LOCK}" grep -q "^${task_id}${SCHED_SEPARATOR}" "${SCHED_TASK_HOLDER}"; do
+    flock "${SCHED_TASK_HOLDER_LOCK}" sed -i "/^"${task_id}${SCHED_SEPARATOR}"/d" ${SCHED_TASK_HOLDER}
   done
 }
 
-function scheduler::run_task() {
+function sched::run_task() {
   local task_id=$1
-  trap 'scheduler::set_task_status "${task_id}" $?' EXIT
-  eval export $(scheduler::get_task_env "${task_id}") IFS=\" \"
-  scheduler::open_xtrace
-  eval $(scheduler::get_task_cmd "${task_id}") &> "$(scheduler::get_task_logfile "${task_id}")"
-  local ret=$?
-  scheduler::close_xtrace
-  exit ${ret}
+  local task_cmd=$(sched::get_task_cmd "${task_id}")
+  local task_logfile=$(sched::get_task_logfile "${task_id}")
+  trap '(sched::set_task_status "${task_id}" $?) 2>/dev/null' EXIT
+  eval export $(sched::get_task_env "${task_id}") IFS=\" \"
+  eval "sched::open_xtrace && ${task_cmd}" &> "${task_logfile}"
+  exit $?
 }
 
-function scheduler::get_task_cmd() {
+function sched::get_task_cmd() {
   local task_id=$1
-  flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" awk -F "${SCHEDULER_SEPARATOR}" "\$1==\"${task_id}\" {print \$2}" "${SCHEDULER_TASK_HOLDER}"
+  flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$1==\"${task_id}\" {print \$2}" "${SCHED_TASK_HOLDER}"
 }
 
-function scheduler::set_task_status() {
+function sched::set_task_status() {
   local task_id=$1
   local task_status=$2
-  until [[ "$(scheduler::get_task_status "${task_id}")" == "${task_status}" ]]; do
-    flock "${SCHEDULER_TASK_HOLDER_LOCK}" sed -i -r "/^"${task_id}${SCHEDULER_SEPARATOR}"/s#${SCHEDULER_SEPARATOR}-?[[:digit:]]+#${SCHEDULER_SEPARATOR}${task_status}#" "${SCHEDULER_TASK_HOLDER}" 2>/dev/null
+  until [[ "$(sched::get_task_status "${task_id}")" == "${task_status}" ]]; do
+    flock "${SCHED_TASK_HOLDER_LOCK}" sed -i -r "/^"${task_id}${SCHED_SEPARATOR}"/s#${SCHED_SEPARATOR}-?[[:digit:]]+#${SCHED_SEPARATOR}${task_status}#" "${SCHED_TASK_HOLDER}" 2>/dev/null
   done
 }
 
-function scheduler::get_task_status() {
+function sched::get_task_status() {
   local task_id=$1
-  flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" awk -F "${SCHEDULER_SEPARATOR}" "\$1==\"${task_id}\" {print \$3}" "${SCHEDULER_TASK_HOLDER}"
+  flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$1==\"${task_id}\" {print \$3}" "${SCHED_TASK_HOLDER}"
 }
 
-function scheduler::set_task_pid() {
+function sched::set_task_pid() {
   local task_id=$1
   local task_pid=$2
-  until [[ "$(scheduler::get_task_pid "${task_id}")" == "${task_pid}" ]]; do
-    flock "${SCHEDULER_TASK_HOLDER_LOCK}" sed -i -r "/^"${task_id}${SCHEDULER_SEPARATOR}"/s#${SCHEDULER_SEPARATOR}${SCHEDULER_TASK_INITIAL_PID}#${SCHEDULER_SEPARATOR}${task_pid}#" "${SCHEDULER_TASK_HOLDER}" 2>/dev/null
+  until [[ "$(sched::get_task_pid "${task_id}")" == "${task_pid}" ]]; do
+    flock "${SCHED_TASK_HOLDER_LOCK}" sed -i -r "/^"${task_id}${SCHED_SEPARATOR}"/s#${SCHED_SEPARATOR}${SCHED_TASK_INITIAL_PID}#${SCHED_SEPARATOR}${task_pid}#" "${SCHED_TASK_HOLDER}" 2>/dev/null
   done
 }
 
-function scheduler::get_task_pid() {
+function sched::get_task_pid() {
   local task_id=$1
-  flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" awk -F "${SCHEDULER_SEPARATOR}" "\$1==\"${task_id}\" {print \$4}" "${SCHEDULER_TASK_HOLDER}"
+  flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$1==\"${task_id}\" {print \$4}" "${SCHED_TASK_HOLDER}"
 }
 
-function scheduler::get_task_logfile() {
+function sched::get_task_logfile() {
   local task_id=$1
-  flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" awk -F "${SCHEDULER_SEPARATOR}" "\$1==\"${task_id}\" {print \$5}" "${SCHEDULER_TASK_HOLDER}"
+  flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$1==\"${task_id}\" {print \$5}" "${SCHED_TASK_HOLDER}"
 }
 
-function scheduler::get_task_env() {
+function sched::get_task_env() {
   local task_id=$1
-  flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" awk -F "${SCHEDULER_SEPARATOR}" "\$1==\"${task_id}\" {print \$6}" "${SCHEDULER_TASK_HOLDER}"
+  flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$1==\"${task_id}\" {print \$6}" "${SCHED_TASK_HOLDER}"
 }
 
-function scheduler::get_caller_env() {
-  echo "${SCHEDULER_CALLER_VARS}$(set | grep '^[a-zA-Z].*=.*')" | sort | uniq -u  | grep -v "=$'" | grep -v -E '^(SCHEDULER_|CI_|PIPESTATUS|BASH|SHELL|FUNCNAME).*$' | tr '\n' ' '
+function sched::get_caller_env() {
+  echo "${SCHED_CALLER_VARS}$(set | grep '^[a-zA-Z].*=.*')" | sort | uniq -u  | grep -v "=$'" | grep -v -E '^(SCHED_|CI_|PIPESTATUS|BASH|SHELL|FUNCNAME).*$' | tr '\n' ' '
 }
 
-function scheduler::get_runnable_tasks() {
-  flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" awk -F "${SCHEDULER_SEPARATOR}" "\$3==${SCHEDULER_TASK_CODE_RUNNABLE} {print \$1}" "${SCHEDULER_TASK_HOLDER}" | sed ':a;N;$!ba;s/\n/ /g'
+function sched::pick_task() {
+  sched::get_priority_runnable_tasks 1 | awk '{print $1}'
 }
 
-function scheduler::get_running_tasks() {
-  flock -s "${SCHEDULER_TASK_HOLDER_LOCK}" awk -F "${SCHEDULER_SEPARATOR}" "\$3==${SCHEDULER_TASK_CODE_RUNNING} {print \$1}" "${SCHEDULER_TASK_HOLDER}" | sed ':a;N;$!ba;s/\n/ /g'
+function sched::get_priority_runnable_tasks() {
+  local select_priority=${1:-0}
+  if [ ${select_priority} == 0 ]; then
+    flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$3==${SCHED_TASK_CODE_RUNNABLE} {print \$1,\$7}" "${SCHED_TASK_HOLDER}" | sort -rnk2 | awk '{print $1}' | sed ':a;N;$!ba;s/\n/ /g'
+  else
+    flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$3==${SCHED_TASK_CODE_RUNNABLE} {print \$1,\$7}" "${SCHED_TASK_HOLDER}" | sort -rnk2 | awk 'NR==1 || arr[1]==$2 {arr[NR]=$2; print $1 | "sort -n"}' | sed ':a;N;$!ba;s/\n/ /g'
+  fi
 }
 
+function sched::get_runnable_tasks() {
+  flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$3==${SCHED_TASK_CODE_RUNNABLE} {print \$1}" "${SCHED_TASK_HOLDER}" | sed ':a;N;$!ba;s/\n/ /g'
+}
+
+function sched::get_running_tasks() {
+  flock -s "${SCHED_TASK_HOLDER_LOCK}" awk -F "${SCHED_SEPARATOR}" "\$3==${SCHED_TASK_CODE_RUNNING} {print \$1}" "${SCHED_TASK_HOLDER}" | sed ':a;N;$!ba;s/\n/ /g'
+}

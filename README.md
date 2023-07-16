@@ -2,9 +2,18 @@
 
 shell-sched is a simple concurrent task scheduler based on shell and few GNU tools.
 
+## Features
+
+- Concurrent and asynchronous
+- Priority based schedule
+- Dynamic tuning and slow start
+- Less intrusion
+
+[![quick_start_image](./demo.gif)](https://asciinema.org/a/597018)
+
 ## Important
 
-   The scheduler can only be enabled when SCHEDULER_ENABLED=1 (default).
+   The scheduler can only be enabled when SCHED_ENABLED=1 (default).
 
    If not, all task emited run serially as normal rather than exit with error.
 
@@ -15,51 +24,57 @@ shell-sched is a simple concurrent task scheduler based on shell and few GNU too
     source sched.sh 
 
     # Startup scheduler
-    scheduler::startup
+    sched::startup
 
     # Emit a task to scheduler
-    scheduler::emit "sleep 10"
+    sched::emit "sleep 10"
 
     # Block current proccess for waiting tasks. Optional, if absent, tasks have still be running in background
-    scheduler::wait_all_tasks
+    sched::wait_all_tasks
 
     # Shutdown scheduler
-    scheduler::shutdown
+    sched::shutdown
 
 ## Exposed environment variables
-   1. SCHEDULER_ENABLED
+   1. SCHED_ENABLED
 
         Enable or disable scheduler
 
         1 -> enable, 0 -> disable
 
-   2. SCHEDULER_MAX_RUNNER_SIZE
+   2. SCHED_DATA_ROOT
+
+       Root path that stored intermediate data on runtime. Default is under /tmp that is generated automaticlly by runtime.
+
+   3. SCHED_MAX_RUNNERS
 
         Max parrallel task counts. Must be great than 0. Default (2 * cpu cores)
         
-   3. SCHEDULER_DEBUG
+   4. SCHED_DEBUG
 
         Enable or disable scheduler debug log
 
         1 -> enable, 0 -> disable
 
 # Exposed functions show as below:
-   1. scheduler::startup
+   1. sched::startup
 
         Start scheduler
 
-   2. scheduler::shutdown
+   2. sched::shutdown
 
         Stop scheduler
 
-   3. scheduler::emit
+   3. sched::emit \<task\> [\<priority\>]
    
-        Emit a task to scheduler which would select a task to execute asynchronously
+        Emit a task to scheduler which would select a task to execute asynchronously based on its priority
 
-   4. scheduler::wait_all_tasks_and_exit
+        Note: task must be a function or one-line command
+
+   4. sched::wait_all_tasks_and_exit
 
         Wait all tasks complete or any error occurred, and exit the calling proceess
 
-   5. scheduler::wait_all_tasks
+   5. sched::wait_all_tasks
    
         Wait all tasks complete or any error occurred, only exit the calling proccess when error occurred
