@@ -1,4 +1,3 @@
-
 function sched::startup() {
   readonly SCHED_ENABLED=${SCHED_ENABLED:-1}
   if ! sched::is_enabled; then
@@ -29,6 +28,7 @@ function sched::startup() {
   fi
 
   readonly SCHED_DEBUG=${SCHED_DEBUG:-0}
+  readonly SCHED_ALLOW_FAILED=${SCHED_ALLOW_FAILED:-0}
   readonly SCHED_TASK_XTRACE_STATE=$(shopt -q -o xtrace; echo $?)
 
   sched::log_info "Sched startup..."
@@ -72,7 +72,7 @@ function sched::dispatcher() {
   set +x
   trap 'exit' SIGUSR1
   while true; do
-    sleep 1
+    sleep 0.1
     local task_id=$(sched::pick_task)
     [[ -z "${task_id}" ]] && continue
     local task_cmd="$(sched::get_task_cmd "${task_id}")"
@@ -99,7 +99,7 @@ function sched::rover() {
         ${SCHED_TASK_CODE_SUCCEED})
           sched::free_runner "${task_cmd}" || continue
           local task_logfile=$(sched::get_task_logfile "${task_id}")
-          sched::log_info "Task ${task_id} [ ${task_cmd} ] succeeded. Log start ${task_logfile}..."
+          sched::log_info "Task ${task_id} succeeded. Log start..."
           cat "${task_logfile}"
           echo
           sched::remove_task "${task_id}"
@@ -109,7 +109,6 @@ function sched::rover() {
           local task_logfile=$(sched::get_task_logfile "${task_id}")
           sched::log_fatal "Task ${task_id} [ ${task_cmd} ] failed. Log start..."
           cat "${task_logfile}"
-          sched::log_fatal "Please check logs [ ${task_logfile} ] for more info about task [ ${task_cmd} ]. Installer will exit."
           echo "${task_ret}" > ${SCHED_TASK_FINAL_STATUS}
           sched::remove_task "${task_id}"
       esac
@@ -122,19 +121,20 @@ function sched::wait_all_tasks() {
   set +x
   sched::is_enabled || return 0
   local need_exit=${1:-0}
+  local last_seek=
   while true; do
-    sleep 2
-    if [[ -s ${SCHED_TASK_FINAL_STATUS} ]]; then
+    sleep 0.5
+    if [[ "${SCHED_ALLOW_FAILED}" == 0  && -s ${SCHED_TASK_FINAL_STATUS} ]]; then
       exit $(cat "${SCHED_TASK_FINAL_STATUS}")
     elif sched::is_tasks_empty; then
       [[ "${need_exit}" == "1" ]] && exit || break
     else
-      local task_id=
-      for task_id in $(sched::get_running_tasks); do
-        local task_logfile="$(sched::get_task_logfile "${task_id}")"
-        sched::log_infonl "Wait for Task ${task_id} Log ${task_logfile}"
-        break
-      done
+      local tasks=($(sched::get_running_tasks))
+      [ "${#tasks[@]}" == 0 ] && continue
+      local task_id=${tasks[$((RANDOM % ${#tasks[@]}))]}
+      [[ "${task_id}" == "${last_seek}" ]] && continue
+      sched::log_infonl "Wait for Task ${task_id} Log $(sched::get_task_logfile "${task_id}")"
+      last_seek=${task_id}
     fi
   done
   sched::open_xtrace
@@ -161,15 +161,15 @@ function sched::print_pending_tasks() {
   sched::log_warn "Pending tasks: ${pending_tasks}"
 }
 
-function sched::log_debug() { [[ "${SCHED_DEBUG}" == "1" ]] && echo -e "\033[K\033[1;34m[sched-debug] $1\033[0m" || true; }
+function sched::log_debug() { [[ "${SCHED_DEBUG}" == "1" ]] && echo -e "\033[K\033[34m[sched-debug] $1\033[0m" || true; }
 
-function sched::log_info() { echo -e "\033[K\033[1;36m[sched-info] $1\033[0m"; }
+function sched::log_info() { echo -e "\033[K\033[36m[sched-info] $1\033[0m"; }
 
 function sched::log_infonl() { echo -e -n "\033[K\033[37m[sched-info] $1\033[0m\r"; }
 
-function sched::log_warn() { echo -e "\033[K\033[1;33m[sched-warn] $1\033[0m"; }
+function sched::log_warn() { echo -e "\033[K\033[33m[sched-warn] $1\033[0m"; }
 
-function sched::log_fatal() { echo -e "\033[K\033[1;31m[sched-fatal] $1\033[0m"; }
+function sched::log_fatal() { echo -e "\033[K\033[31m[sched-fatal] $1\033[0m"; }
 
 function sched::open_xtrace() { [[ "${SCHED_TASK_XTRACE_STATE}" == "0" ]] && set -x || true; }
 
@@ -275,7 +275,7 @@ function sched::run_task() {
   local task_cmd=$(sched::get_task_cmd "${task_id}")
   local task_logfile=$(sched::get_task_logfile "${task_id}")
   trap '(sched::set_task_status "${task_id}" $?) 2>/dev/null' EXIT
-  eval export $(sched::get_task_env "${task_id}") IFS=\" \"
+  eval export $(sched::get_task_env "${task_id}") IFS=\"$' \t\n'\"
   eval "sched::open_xtrace && ${task_cmd}" &> "${task_logfile}"
   exit $?
 }
@@ -322,7 +322,16 @@ function sched::get_task_env() {
 }
 
 function sched::get_caller_env() {
-  echo "${SCHED_CALLER_VARS}$(set | grep '^[a-zA-Z].*=.*')" | sort | uniq -u  | grep -v "=$'" | grep -v -E '^(SCHED_|CI_|PIPESTATUS|BASH|SHELL|FUNCNAME).*$' | tr '\n' ' '
+  local sched_caller_env=
+  local env_tmp=$(echo "${SCHED_CALLER_VARS}$(set | grep '^[a-zA-Z].*=.*')" | sort | uniq -u  | grep -v "=$'" | grep -v -E '^(sched_|SCHED_|CI_|PIPESTATUS|BASH|SHELL|FUNCNAME).*$')
+  while IFS=$'\n' read -r env; do
+    local same_env=false
+    for var in ${SCHED_CALLER_VARS}; do
+      [ "$env" == "$var" ] && same_env=true && break
+    done
+    $same_env || sched_caller_env+=" $env "
+  done <<<"$env_tmp"
+  echo "$sched_caller_env"
 }
 
 function sched::pick_task() {
